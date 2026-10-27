@@ -108,9 +108,17 @@ fs.mkdirSync(PROFILES, { recursive: true });
   // 4. discard=true wipes
   const c3 = await c.call("browser_close", {}); // no-op guard
   check("close without browser ok", c3.closed === true, JSON.stringify(c3));
-  await c.call("browser_open", { url: "https://example.com", profile: "smokep" });
+  const c3o = await c.call("browser_open", { url: "https://example.com", profile: "smokep" });
+  check("reopen smokep before discard", c3o.profile === "smokep" && c3o.persistent === true, JSON.stringify(c3o));
   const c4 = await c.call("browser_close", { discard: true, profile: "smokep" });
   check("discard wipes named profile", c4.wiped === true && !fs.existsSync(path.join(PROFILES, "smokep")), JSON.stringify(c4));
+
+  // 4b. idle discard: with NO browser running, discard+profile wipes the dir from disk
+  await c.call("browser_open", { url: "https://example.com", profile: "idledrop" });
+  const idc = await c.call("browser_close", { profile: "idledrop" }); // keep data
+  check("idle-discard precondition: closed, kept", idc.wiped === false && fs.existsSync(path.join(PROFILES, "idledrop")), JSON.stringify(idc));
+  const idc2 = await c.call("browser_close", { discard: true, profile: "idledrop" }); // idle wipe, no launch
+  check("idle discard wipes named profile without launch", idc2.closed === true && idc2.wiped === true && !fs.existsSync(path.join(PROFILES, "idledrop")), JSON.stringify(idc2));
 
   // 5. profile stickiness semantics (m00651)
   await c.call("browser_open", { url: "https://example.com", profile: "stick" });

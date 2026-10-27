@@ -49,7 +49,9 @@ Default is **throwaway**: a fresh temp `user-data-dir` per launch, wiped on
   reopen. Name charset: `[a-zA-Z0-9_-]`. If another live Chrome holds that
   profile, the call is rejected with `profile "name" is in use by pid N`.
 - `browser_close({ discard: true, profile })` — wipe the named profile's data
-  (without `discard` it is kept).
+  (without `discard` it is kept). Works with no browser running too: the named
+  profile dir is wiped from disk without launching anything (refused while a
+  live browser/lock holder owns it).
 - Switching profiles in one server restarts the browser cleanly (throwaway is
   wiped, named is kept).
 - Profile semantics for `browser_open` without `profile`:

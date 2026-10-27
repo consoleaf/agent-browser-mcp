@@ -849,7 +849,20 @@ function touchIdle() {
   if (IDLE_S > 0) idleTimer = setTimeout(closeChrome, IDLE_S * 1000);
 }
 
-export async function closeChrome(opts = {}) {
+export // rm with retry: crashpad/telemetry children can outlive chrome briefly and
+// recreate the dir after the wipe (POSIX); win32 AV/indexers can hold file
+// locks a moment past process exit. 3 attempts, 300ms apart.
+async function rmProfileDir(dir) {
+  let wiped = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); wiped = true; } catch {}
+    if (!fs.existsSync(dir)) break;
+    await sleep(300);
+  }
+  return wiped && !fs.existsSync(dir);
+}
+
+async function closeChrome(opts = {}) {
   if (idleTimer) clearTimeout(idleTimer);
   try { if (ws) ws.close(); } catch {}
   ws = null;
@@ -865,14 +878,7 @@ export async function closeChrome(opts = {}) {
   curHeadless = null;
   if (p) {
     if (!p.persistent || opts.discard) {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try { fs.rmSync(p.dir, { recursive: true, force: true }); wiped = true; } catch {}
-        // crashpad/telemetry children can outlive the chrome main briefly and
-        // recreate the dir after the wipe — verify and retry.
-        if (!fs.existsSync(p.dir)) break;
-        await sleep(300);
-      }
-      wiped = wiped && !fs.existsSync(p.dir);
+      wiped = await rmProfileDir(p.dir);
     }
     if (opts.discard && lastRequested === p.name) lastRequested = null;
   }
@@ -1167,10 +1173,26 @@ const tools = {
   },
 
   browser_close: async ({ discard = false, profile } = {}) => {
-    if (profile !== undefined && (curProfile?.name ?? null) !== (profile || null)) {
-      throw new Error(curProfile ? `current profile is ${JSON.stringify(curProfile.name)}, not ${JSON.stringify(profile)}` : "no browser running");
+    if (chromeProc) {
+      if (profile !== undefined && (curProfile?.name ?? null) !== (profile || null)) {
+        throw new Error(curProfile ? `current profile is ${JSON.stringify(curProfile.name)}, not ${JSON.stringify(profile)}` : "no browser running");
+      }
+      return await closeChrome({ discard });
     }
-    return await closeChrome({ discard });
+    // idle: idempotent close. discard + named profile wipes that profile dir
+    // from disk without launching a browser (refuses if a live holder owns it).
+    if (discard && profile) {
+      const name = sanitizeName(profile);
+      const dir = path.join(PROFILES_DIR, name);
+      if (fs.existsSync(dir)) {
+        const holders = profileHolders(dir);
+        if (holders.lockHolderPid || holders.chromePid) throw new Error(`profile "${name}" is in use (lock ${holders.lockHolderPid ?? "-"}, chrome ${holders.chromePid ?? "-"}) — close its browser first`);
+        if (lastRequested === name) lastRequested = null;
+        return { closed: true, profile: name, wiped: await rmProfileDir(dir) };
+      }
+      return { closed: true, profile: name, wiped: true };
+    }
+    return { closed: true, profile: null, wiped: false };
   },
 
   browser_wait: async ({ seconds = 5 }) => {
@@ -1195,7 +1217,7 @@ const TOOL_DEFS = [
   { name: "browser_scroll", description: "Scroll the page", inputSchema: { type: "object", properties: { direction: { type: "string", enum: ["down", "up", "top", "bottom"] }, screens: { type: "number" } } } },
   { name: "browser_screenshot", description: "Screenshot; saved under the server home dir, path returned", inputSchema: { type: "object", properties: { full_page: { type: "boolean" } } } },
   { name: "browser_eval", description: "Evaluate a JS expression in the page (Runtime.evaluate, awaited); returns {value}. Use for checks (navigator.webdriver etc.) and small scrapes.", inputSchema: { type: "object", required: ["expression"], properties: { expression: { type: "string" } } } },
-  { name: "browser_close", description: "Close the browser now (reopens on next call). Named profiles persist by default; pass discard=true to wipe the current profile's data. profile: assert which profile is being closed.", inputSchema: { type: "object", properties: { discard: { type: "boolean" }, profile: { type: "string" } } } },
+  { name: "browser_close", description: "Close the browser now (reopens on next call). Named profiles persist by default; pass discard=true to wipe the current profile's data. Works with no browser running too: discard=true + profile wipes that named profile dir from disk without launching anything. profile: when a browser runs, assert which profile is being closed.", inputSchema: { type: "object", properties: { discard: { type: "boolean" }, profile: { type: "string" } } } },
   { name: "browser_wait", description: "Wait N seconds (max 60), then return url/title", inputSchema: { type: "object", properties: { seconds: { type: "number" } } } },
 ];
 
