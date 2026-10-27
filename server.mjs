@@ -18,8 +18,8 @@
 //   AB_HEADLESS      1 = headless      (default 0)
 //   AB_EXTRA_ARGS    extra Chrome flags, space-separated
 //
-// Tools: browser_status, browser_open, browser_back, browser_read,
-//        browser_click, browser_hover, browser_type, browser_press,
+// Tools: browser_status, browser_profiles, browser_open, browser_back,
+//        browser_read, browser_click, browser_hover, browser_type, browser_press,
 //        browser_scroll, browser_screenshot, browser_close, browser_wait
 
 import { spawn } from "node:child_process";
@@ -297,6 +297,62 @@ function acquireProfileLock(p) {
 function releaseProfileLock(p) {
   if (!p) return;
   try { fs.rmSync(path.join(p.dir, ".agent-browser.lock"), { force: true }); } catch {}
+}
+
+// ------- profile inspection (browser_profiles tool; read-only, never launches) -------
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } // EPERM on win32 = exists
+}
+
+// Live holder of a profile dir, or null: our .agent-browser.lock first, then
+// (POSIX) a live Chrome SingletonLock — the two ways a dir can be in use.
+function profileHolders(dir) {
+  const out = {};
+  try {
+    const pid = Number(fs.readFileSync(path.join(dir, ".agent-browser.lock"), "utf8").trim());
+    if (Number.isFinite(pid) && pidAlive(pid)) out.lockHolderPid = pid;
+  } catch {}
+  if (!IS_WIN) {
+    try {
+      const t = fs.readlinkSync(path.join(dir, "SingletonLock"));
+      const pid = Number(t.split("-").pop());
+      if (Number.isFinite(pid) && pidAlive(pid)) out.chromePid = pid;
+    } catch {}
+  }
+  return out;
+}
+
+// Rough recursive size + newest mtime; unreadable entries are skipped.
+function dirStats(dir) {
+  let bytes = 0, newest = 0;
+  const walk = (d) => {
+    let ents; try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile()) { try { const st = fs.statSync(p); bytes += st.size; if (st.mtimeMs > newest) newest = st.mtimeMs; } catch {} }
+    }
+  };
+  walk(dir);
+  return { bytes, newest };
+}
+
+function listNamedProfiles() {
+  let ents; try { ents = fs.readdirSync(PROFILES_DIR, { withFileTypes: true }); } catch { return []; }
+  return ents.filter((e) => e.isDirectory())
+    .map((e) => {
+      const dir = path.join(PROFILES_DIR, e.name);
+      const h = profileHolders(dir);
+      const { bytes, newest } = dirStats(dir);
+      return {
+        name: e.name, dir,
+        inUse: h.lockHolderPid != null || h.chromePid != null,
+        ...h,
+        sizeBytes: bytes, sizeMB: Math.round((bytes / 1048576) * 10) / 10,
+        ...(newest ? { lastModified: new Date(newest).toISOString() } : {}),
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 // Per-launch CDP port: default AB_PORT, but if something already listens
@@ -783,7 +839,8 @@ async function navigate(url) {
 
 async function currentPage() {
   const r = await evalJs("JSON.stringify({url: location.href, title: document.title})");
-  return JSON.parse(r);
+  // identity context rides along on every page-shaped response
+  return { ...JSON.parse(r), ...(curProfile ? { activeProfile: { name: curProfile.name, dir: curProfile.dir, persistent: !!curProfile.persistent } } : {}) };
 }
 
 // ------------------------------------------------------- idle auto-close
@@ -902,6 +959,19 @@ const tools = {
   browser_status: async () => {
     await ensureBrowser();
     return currentPage();
+  },
+
+  browser_profiles: async () => {
+    // read-only inventory; NEVER launches a browser
+    return {
+      profilesDir: PROFILES_DIR,
+      named: listNamedProfiles(),
+      browserRunning: !!curProfile,
+      active: curProfile ? { name: curProfile.name, dir: curProfile.dir, persistent: !!curProfile.persistent } : null,
+      defaultSource: PROFILE ? "AB_PROFILE env" : "throwaway (fresh temp dir per launch)",
+      ...(PROFILE ? { defaultDir: PROFILE } : {}),
+      lastRequested,
+    };
   },
 
   browser_open: async ({ url, profile, headless, newTab, tabIndex }) => {
@@ -1112,7 +1182,8 @@ const tools = {
 
 // ------------------------------------------------------------ MCP stdio
 const TOOL_DEFS = [
-  { name: "browser_status", description: "Launch the dedicated browser if needed; return current url/title", inputSchema: { type: "object", properties: {} } },
+  { name: "browser_status", description: "Launch the dedicated browser if needed; return current url/title (plus activeProfile identity context)", inputSchema: { type: "object", properties: {} } },
+  { name: "browser_profiles", description: "List browser profiles WITHOUT launching a browser: named profiles (~/.agent-browser/profiles/<name>/) with in-use/lock state, rough size and last-modified; the active profile (if a browser runs); the default source when no profile is passed (AB_PROFILE env dir or throwaway temp); and lastRequested profile name.", inputSchema: { type: "object", properties: {} } },
   { name: "browser_open", description: "Navigate to a URL. Optional profile: named persistent profile (~/.agent-browser/profiles/<name>/, cookies/storage survive); omit for a throwaway profile (default; wiped on close). headless: true/false overrides AB_HEADLESS for this launch (headless recommended for automation/cron; headful is for interactive/human-login use). Switching profile or headless mode restarts the browser. newTab: open in a NEW tab and switch to it. tabIndex: focus an existing tab (by index) and navigate it. Responses may carry tabs_changed when sites spawn/close tabs.", inputSchema: { type: "object", required: ["url"], properties: { url: { type: "string" }, profile: { type: "string", description: "[a-zA-Z0-9_-]; rejected if another Chrome is using it" }, headless: { type: "boolean" }, newTab: { type: "boolean" }, tabIndex: { type: "number" } } }, },
   { name: "browser_tabs", description: "Tab management. action=list returns tabs (index/targetId/url/title + activeTargetId); action=focus switches the driver to a tab (tabIndex or targetId); action=close closes one (tabIndex or targetId; closing the active tab switches to the first remaining). Indexes are STABLE: tabIndex N refers to the Nth tab of the most recent list you saw — after tabs spawn/close, re-list before using indexes again. Canonical selector param is tabIndex (no \"index\").", inputSchema: { type: "object", properties: { action: { type: "string", enum: ["list", "focus", "close"] }, tabIndex: { type: "number" }, targetId: { type: "string" } } } },
   { name: "browser_back", description: "Go back in history", inputSchema: { type: "object", properties: {} } },

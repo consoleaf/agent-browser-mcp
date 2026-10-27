@@ -58,6 +58,10 @@ fs.mkdirSync(PROFILES, { recursive: true });
   const c = mkClient({ AB_IDLE_SECONDS: "0", AB_HEADLESS: "1" });
   await c.start();
 
+  // 0. browser_profiles with NO browser running: pure read, must NOT launch
+  const p0 = await c.call("browser_profiles", {});
+  check("profiles cold: no browser, throwaway default", p0.browserRunning === false && p0.active === null && p0.defaultSource.startsWith("throwaway") && Array.isArray(p0.named) && p0.lastRequested === null, JSON.stringify(p0));
+
   // 1. throwaway default, wiped on close
   const tmpBefore = fs.readdirSync(HOME).filter(d => d.startsWith("tmp-profile-"));
   const o1 = await c.call("browser_open", { url: "https://example.com" });
@@ -96,6 +100,11 @@ fs.mkdirSync(PROFILES, { recursive: true });
   check("profile has Chrome data files", fs.existsSync(path.join(PROFILES, "smokep", "Default")));
   await c.call("browser_close", { profile: "smokep" });
 
+  // 3b. browser_profiles idle listing: named profile on disk, not in use
+  const p1 = await c.call("browser_profiles", {});
+  const sp1 = (p1.named || []).find((x) => x.name === "smokep");
+  check("profiles lists named profile idle", p1.browserRunning === false && !!sp1 && sp1.inUse === false && sp1.sizeBytes > 0 && !!sp1.lastModified, JSON.stringify(sp1));
+
   // 4. discard=true wipes
   const c3 = await c.call("browser_close", {}); // no-op guard
   check("close without browser ok", c3.closed === true, JSON.stringify(c3));
@@ -105,6 +114,11 @@ fs.mkdirSync(PROFILES, { recursive: true });
 
   // 5. profile stickiness semantics (m00651)
   await c.call("browser_open", { url: "https://example.com", profile: "stick" });
+  const p2 = await c.call("browser_profiles", {});
+  const st = (p2.named || []).find((x) => x.name === "stick");
+  check("profiles marks in-use + active + lastRequested", p2.browserRunning === true && p2.active && p2.active.name === "stick" && p2.active.persistent === true && p2.lastRequested === "stick" && !!st && st.inUse === true && (st.lockHolderPid != null || st.chromePid != null), JSON.stringify({ active: p2.active, st }));
+  const stat = await c.call("browser_status", {});
+  check("status carries activeProfile", stat.activeProfile && stat.activeProfile.name === "stick" && stat.activeProfile.persistent === true, JSON.stringify(stat.activeProfile));
   const nav = await c.call("browser_open", { url: "https://www.wikipedia.org" }); // running + omitted → SAME browser
   check("running + omitted profile keeps current browser", nav.profile === "stick" && nav.persistent === true && nav.url.includes("wikipedia"), JSON.stringify(nav));
   const sw = await c.call("browser_open", { url: "https://example.com", profile: "stick2" }); // explicit different → switch
@@ -136,6 +150,8 @@ fs.mkdirSync(PROFILES, { recursive: true });
   const abp = fs.mkdtempSync(path.join(os.tmpdir(), "abp-"));
   const c = mkClient({ AB_IDLE_SECONDS: "0", AB_HEADLESS: "1", AB_PROFILE: abp });
   await c.start();
+  const pe = await c.call("browser_profiles", {});
+  check("profiles reports AB_PROFILE default", pe.defaultSource === "AB_PROFILE env" && !!pe.defaultDir, JSON.stringify({ s: pe.defaultSource, d: pe.defaultDir }));
   const o = await c.call("browser_open", { url: "https://example.com" });
   check("AB_PROFILE default persistent", o.persistent === true && o.profile === null && o.url.includes("example.com"), JSON.stringify(o));
   const cl = await c.call("browser_close", {});
@@ -150,6 +166,10 @@ fs.mkdirSync(PROFILES, { recursive: true });
   const b = mkClient({ AB_IDLE_SECONDS: "0", AB_HEADLESS: "1" });
   await a.start(); await b.start();
   await a.call("browser_open", { url: "https://example.com", profile: "smokebusy" });
+  // cross-server: b SEES a's profile as in-use via browser_profiles
+  const pb = await b.call("browser_profiles", {});
+  const sb = (pb.named || []).find((x) => x.name === "smokebusy");
+  check("profiles cross-server in-use", !!sb && sb.inUse === true && sb.lockHolderPid != null, JSON.stringify(sb));
   const r = await b.call("browser_open", { url: "https://example.com", profile: "smokebusy" });
   check("in-use profile -> structured busy", r.error === "busy" && r.profile === "smokebusy" && typeof r.retryAfterMs === "number", JSON.stringify(r));
   // b must still be usable with a different profile afterwards

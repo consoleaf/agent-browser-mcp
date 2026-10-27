@@ -28,7 +28,7 @@ profile is already authenticated.
 
 ## Tools
 
-`browser_status`, `browser_open`, `browser_back`,
+`browser_status`, `browser_profiles`, `browser_open`, `browser_back`,
 `browser_read` (mode=text | snapshot with stable `eN` refs, `wait_for_text`),
 `browser_click` (ref | text, confirm-gated), `browser_hover`, `browser_type`
 (native setter, frameworks notice; returns final value), `browser_press`,
@@ -61,6 +61,26 @@ Default is **throwaway**: a fresh temp `user-data-dir` per launch, wiped on
   - explicit `profile` differing from the running one → clean restart-switch.
 - `AB_PROFILE` env still works: when set, it is the persistent default for
 calls without `profile` (instead of throwaway).
+
+## Profile inventory
+
+`browser_profiles()` — read-only, never launches a browser. Answers "what
+profiles exist and which am I in" without filesystem access:
+
+- `named` — profiles under `~/.agent-browser/profiles/` with `inUse`
+  (live `.agent-browser.lock` holder or, on POSIX, a live Chrome
+  `SingletonLock`), `lockHolderPid`/`chromePid` when held, rough `sizeBytes`/
+  `sizeMB`, and `lastModified`;
+- `active` — the running browser's profile (`null` if none);
+- `browserRunning` — whether a browser is up;
+- `defaultSource` — `"AB_PROFILE env"` (with `defaultDir`) or
+  `"throwaway (fresh temp dir per launch)"` — what a `browser_open` without
+  `profile` resolves to;
+- `lastRequested` — the last profile name a caller asked for.
+
+Every `browser_status`/`browser_open`-style response also carries
+`activeProfile: { name, dir, persistent }` identity context while a browser
+runs.
 
 ## Env
 
