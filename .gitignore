@@ -1,0 +1,4 @@
+profiles/
+screenshots/
+*.log
+tmp-profile-*
