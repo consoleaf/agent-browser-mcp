@@ -3,6 +3,7 @@
 // survives close/reopen), discard wipe, AB_PROFILE env default, basics
 // (open/read/snapshot/click/screenshot).
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,7 +15,7 @@ function check(name, cond, extra = "") {
 }
 
 function mkClient(env) {
-  const proc = spawn("bun", [new URL("./server.mjs", import.meta.url).pathname], {
+  const proc = spawn("bun", [fileURLToPath(new URL("./server.mjs", import.meta.url))], {
     env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "inherit"],
   });
   let buf = "";
@@ -48,6 +49,9 @@ function mkClient(env) {
 
 const HOME = process.env.AB_HOME || path.join(os.homedir(), ".agent-browser");
 const PROFILES = path.join(HOME, "profiles");
+// first run on a fresh host: the server creates these on first launch, but suite 1
+// inspects HOME before any browser_open — ENOENT otherwise.
+fs.mkdirSync(PROFILES, { recursive: true });
 
 // --- suite 1: default env (headless, throwaway default + named profiles)
 {
@@ -232,10 +236,27 @@ const PROFILES = path.join(HOME, "profiles");
   await c.start();
   const o1 = await c.call("browser_open", { url: "https://example.com", headless: true });
   check("headless:true override", o1.headless === true && o1.url.includes("example.com"), JSON.stringify(o1));
+  const g1 = await c.call("browser_eval", { expression: "JSON.stringify([screen.width, screen.height])" });
+  // the 1920x1080 pin is an ozone (Linux) flag — on Windows it doesn't apply, only sanity-check dims there
+  const pinOk = (v) => process.platform === "win32" ? /^\[\d+,\d+\]$/.test(String(v)) : v === "[1920,1080]";
+  check("headless screen pinned 1920x1080 (no 800x600 tell)" + (process.platform === "win32" ? " [win32: sane dims only]" : ""), pinOk(g1.value), JSON.stringify(g1.value));
   const o2 = await c.call("browser_open", { url: "https://example.com", headless: false });
   const hasDisplay = !!(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
-  check("headless:false override" + (hasDisplay ? "" : " (no display → auto-fallback accepted)"), o2.headless === !hasDisplay, JSON.stringify(o2));
-  if (hasDisplay && !o2.headless) {
+  // Server truth drives the branches: with a desktop it launches REAL headful (window bounds
+  // present); without one it gracefully skips — falls back to headless, reports that
+  // truthfully, keeps the screen pin, and fakes no window geometry. (The server may find a
+  // desktop the smoke env can't see via session-env inheritance, so don't hard-eq !hasDisplay.)
+  check("headless:false override (headful) or graceful skip (no desktop)", !o2.ERR && o2.headless !== undefined, JSON.stringify(o2).slice(0, 300));
+  if (o2.headless === false) {
+    check("real headful carries window bounds", !!o2.window, JSON.stringify(o2.window || null));
+  } else {
+    check("graceful skip reports headless truthfully", o2.headless === true, JSON.stringify({ headless: o2.headless }));
+    check("graceful skip fakes no window bounds", o2.window === undefined, JSON.stringify(o2.window ?? null));
+    const g2 = await c.call("browser_eval", { expression: "JSON.stringify([screen.width, screen.height])" });
+    check("graceful-skip launch pins screen 1920x1080" + (process.platform === "win32" ? " [win32: sane dims only]" : ""), pinOk(g2.value), JSON.stringify(g2.value));
+  }
+  if (hasDisplay) check("desktop host must not silently degrade to headless", o2.headless === false, JSON.stringify({ headless: o2.headless }));
+  if (!o2.headless) {
     await c.call("browser_open", { url: "https://example.com" }); // implicit navigate keeps headful browser
     const g = await c.call("browser_eval", { expression: "JSON.stringify({sw:screen.width,sh:screen.height,ow:outerWidth,oh:outerHeight,x:screenX,y:screenY})" });
     const geo = JSON.parse(typeof g === "string" ? g : g.value);

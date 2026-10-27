@@ -30,6 +30,7 @@ import os from "node:os";
 import path from "node:path";
 
 const HOME = process.env.AB_HOME || path.join(os.homedir(), ".agent-browser");
+fs.mkdirSync(HOME, { recursive: true }); // first-ever run: profiles/tmp-profiles/screenshots all live under HOME
 const PROFILE = process.env.AB_PROFILE || null; // persistent default ONLY if explicitly set via env; otherwise throwaway per launch
 const PORT = Number(process.env.AB_PORT || 9777);
 const IDLE_S = Number(process.env.AB_IDLE_SECONDS ?? 900);
@@ -163,7 +164,7 @@ function groupMembers(leaderPid) {
   return out;
 }
 
-const CHROME_CANDIDATES = IS_WIN ? [
+const CHROME_CANDIDATES = (IS_WIN ? [
   process.env.AB_CHROME,
   ...(process.env.ProgramFiles ? [path.join(process.env.ProgramFiles, "Google", "Chrome", "Application", "chrome.exe")] : []),
   ...(process.env["ProgramFiles(x86)"] ? [path.join(process.env["ProgramFiles(x86)"], "Google", "Chrome", "Application", "chrome.exe")] : []),
@@ -175,7 +176,7 @@ const CHROME_CANDIDATES = IS_WIN ? [
   "brave-browser", "msedge",
   "/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium",
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-].filter(Boolean);
+]).filter(Boolean);
 
 // ---------------------------------------------------------------- state
 const PROFILES_DIR = path.join(HOME, "profiles");
@@ -319,6 +320,7 @@ async function pickPort() {
 
 async function launchChrome() {
   await inheritSessionEnv(); // fresh live-session env on every launch (theme vars, XAUTHORITY)
+  lastWindowBounds = null; // per-launch state: fitHeadfulWindow repopulates it for real headful launches
   const p = curProfile;
   const bin = findChromeSync();
   if (!bin) throw new Error("No Chrome/Chromium binary found; set AB_CHROME");
@@ -347,13 +349,16 @@ async function launchChrome() {
     `--window-size=1920,1080`,
   ];
   let headless = curHeadless ?? HEADLESS;
-  // headless default ozone screen is 800x600 — a fingerprint tell next to a 1920 window.
-  // Pin the virtual screen to 1080p; inner viewport lands at 1920x937 (maximized-like).
-  if (headless) args.push("--ozone-override-screen-size=1920,1080");
   const hasDisplay = IS_WIN || !!(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
   if (!headless && !hasDisplay) {
     headless = true; // no display available (e.g. minimal service env) — fall back rather than crash-loop
+    curHeadless = true; // keep the reported state truthful: this launch IS headless
+    lastWindowBounds = null; workArea = null; // no real window geometry to report — don't leak a stale/fake one
   }
+  // headless default ozone screen is 800x600 — a fingerprint tell next to a 1920 window.
+  // Pin the virtual screen to 1080p; inner viewport lands at 1920x937 (maximized-like).
+  // (AFTER the fallback above: a fallback launch missed this pin and showed the 800x600 tell.)
+  if (headless) args.push("--ozone-override-screen-size=1920,1080");
   if (headless) args.push("--headless=new");
   // headful: pick the backend the LIVE session actually provides. Chrome's
   // default choice can fall back to a bare X11/default 800x600 screen even
